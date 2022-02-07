@@ -27,7 +27,6 @@ from tensorboardX import SummaryWriter
 from utils import FreezeParameters
 from utils import imagine_ahead
 from utils import lambda_return
-from utils import lineplot
 
 # Hyperparameters
 parser = argparse.ArgumentParser()
@@ -376,12 +375,12 @@ for episode in tqdm(
         metrics["steps"].append(t + metrics["steps"][-1])
         metrics["episodes"].append(episode)
         metrics["train_rewards"].append(total_reward)
-        lineplot(
-            metrics["episodes"][-len(metrics["train_rewards"]) :],
-            metrics["train_rewards"],
-            "train_rewards",
-            results_dir,
-        )
+        # lineplot(
+        #     metrics["episodes"][-len(metrics["train_rewards"]) :],
+        #     metrics["train_rewards"],
+        #     "train_rewards",
+        #     results_dir,
+        # )
 
     # Test model
     print("Test model")
