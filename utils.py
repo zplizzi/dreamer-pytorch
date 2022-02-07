@@ -137,9 +137,8 @@ class ActivateParameters:
         ```
         :param modules: iterable of modules. used to call .parameters() to freeze gradients.
         """
-
-    self.modules = modules
-    self.param_states = [p.requires_grad for p in get_parameters(self.modules)]
+        self.modules = modules
+        self.param_states = [p.requires_grad for p in get_parameters(self.modules)]
 
     def __enter__(self):
         for param in get_parameters(self.modules):
@@ -178,8 +177,8 @@ class FreezeParameters:
         :param modules: iterable of modules. used to call .parameters() to freeze gradients.
         """
 
-    self.modules = modules
-    self.param_states = [p.requires_grad for p in get_parameters(self.modules)]
+        self.modules = modules
+        self.param_states = [p.requires_grad for p in get_parameters(self.modules)]
 
     def __enter__(self):
         for param in get_parameters(self.modules):

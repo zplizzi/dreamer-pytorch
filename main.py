@@ -242,7 +242,7 @@ value_optimizer = optim.Adam(
     lr=0 if args.learning_rate_schedule != 0 else args.value_learning_rate,
     eps=args.adam_epsilon,
 )
-if args.models is not "" and os.path.exists(args.models):
+if args.models != "" and os.path.exists(args.models):
     model_dicts = torch.load(args.models)
     transition_model.load_state_dict(model_dicts["transition_model"])
     observation_model.load_state_dict(model_dicts["observation_model"])
