@@ -122,3 +122,4 @@ MUJOCO_LOG.TXT
 test.py
 .vscode/
 results-dev
+.idea/
