@@ -18,17 +18,18 @@ class ExperienceReplay:
         self.rewards = np.empty((size,), dtype=np.float32)
         self.nonterminals = np.empty((size, 1), dtype=np.float32)
         self.idx = 0
-        self.full = False  # Tracks if memory has been filled/all slots are valid
-        self.steps, self.episodes = 0, 0  # Tracks how much experience has been used in total
+        # Decentre and discretise visual observations (to save memory)
+        self.full = False
+        # Decentre and discretise visual observations (to save memory)
+        self.steps, self.episodes = 0, 0
         self.bit_depth = bit_depth
 
     def append(self, observation, action, reward, done):
         if self.symbolic_env:
             self.observations[self.idx] = observation.numpy()
         else:
-            self.observations[self.idx] = postprocess_observation(
-                observation.numpy(), self.bit_depth
-            )  # Decentre and discretise visual observations (to save memory)
+            # Decentre and discretise visual observations (to save memory)
+            self.observations[self.idx] = postprocess_observation(observation.numpy(), self.bit_depth)
         self.actions[self.idx] = action.numpy()
         self.rewards[self.idx] = reward
         self.nonterminals[self.idx] = not done
@@ -49,7 +50,8 @@ class ExperienceReplay:
         vec_idxs = idxs.transpose().reshape(-1)  # Unroll indices
         observations = torch.as_tensor(self.observations[vec_idxs].astype(np.float32))
         if not self.symbolic_env:
-            preprocess_observation_(observations, self.bit_depth)  # Undo discretisation for visual observations
+            # Undo discretisation for visual observations
+            preprocess_observation_(observations, self.bit_depth)
         return (
             observations.reshape(L, n, *observations.shape[1:]),
             self.actions[vec_idxs].reshape(L, n, -1),

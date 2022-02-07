@@ -24,7 +24,6 @@ from models import RewardModel
 from models import TransitionModel
 from models import ValueModel
 from models import bottle
-from planner import MPCPlanner
 from tensorboardX import SummaryWriter
 from utils import FreezeParameters
 from utils import imagine_ahead
@@ -33,11 +32,9 @@ from utils import lineplot
 from utils import write_video
 
 # Hyperparameters
-parser = argparse.ArgumentParser(description="PlaNet or Dreamer")
-parser.add_argument("--algo", type=str, default="dreamer", help="planet or dreamer")
+parser = argparse.ArgumentParser()
 parser.add_argument("--id", type=str, default="default", help="Experiment ID")
 parser.add_argument("--seed", type=int, default=1, metavar="S", help="Random seed")
-parser.add_argument("--disable-cuda", action="store_true", help="Disable CUDA")
 parser.add_argument(
     "--env",
     type=str,
@@ -47,26 +44,13 @@ parser.add_argument(
 )
 parser.add_argument("--symbolic-env", action="store_true", help="Symbolic features")
 parser.add_argument("--max-episode-length", type=int, default=1000, metavar="T", help="Max episode length")
-parser.add_argument(
-    "--experience-size", type=int, default=1000000, metavar="D", help="Experience replay size"
-)  # Original implementation has an unlimited buffer size, but 1 million is the max experience collected anyway
-parser.add_argument(
-    "--cnn-activation-function",
-    type=str,
-    default="relu",
-    choices=dir(F),
-    help="Model activation function for a convolution layer",
-)
-parser.add_argument(
-    "--dense-activation-function",
-    type=str,
-    default="elu",
-    choices=dir(F),
-    help="Model activation function a dense layer",
-)
-parser.add_argument(
-    "--embedding-size", type=int, default=1024, metavar="E", help="Observation embedding size"
-)  # Note that the default encoder for visual observations outputs a 1024D vector; for other embedding sizes an additional fully-connected layer is used
+# Original implementation has an unlimited buffer size, but 1 million is the max experience collected anyway
+parser.add_argument("--experience-size", type=int, default=1000000, metavar="D", help="Experience replay size")
+parser.add_argument("--cnn-activation-function", type=str, default="relu", choices=dir(F))
+parser.add_argument("--dense-activation-function", type=str, default="elu", choices=dir(F))
+# Note that the default encoder for visual observations outputs a 1024D vector;
+# for other embedding sizes an additional fully-connected layer is used
+parser.add_argument("--embedding-size", type=int, default=1024, metavar="E", help="Observation embedding size")
 parser.add_argument("--hidden-size", type=int, default=200, metavar="H", help="Hidden size")
 parser.add_argument("--belief-size", type=int, default=200, metavar="H", help="Belief/hidden size")
 parser.add_argument("--state-size", type=int, default=30, metavar="Z", help="State/latent size")
@@ -125,7 +109,6 @@ parser.add_argument("--disclam", type=float, default=0.95, metavar="H", help="di
 parser.add_argument("--optimisation-iters", type=int, default=10, metavar="I", help="Planning optimisation iterations")
 parser.add_argument("--candidates", type=int, default=1000, metavar="J", help="Candidate samples per iteration")
 parser.add_argument("--top-candidates", type=int, default=100, metavar="K", help="Number of top candidates to fit")
-parser.add_argument("--test", action="store_true", help="Test only")
 parser.add_argument("--test-interval", type=int, default=25, metavar="I", help="Test interval (episodes)")
 parser.add_argument("--test-episodes", type=int, default=10, metavar="E", help="Number of test episodes")
 parser.add_argument("--checkpoint-interval", type=int, default=50, metavar="I", help="Checkpoint interval (episodes)")
@@ -133,27 +116,19 @@ parser.add_argument("--checkpoint-experience", action="store_true", help="Checkp
 parser.add_argument("--models", type=str, default="", metavar="M", help="Load model checkpoint")
 parser.add_argument("--experience-replay", type=str, default="", metavar="ER", help="Load experience replay")
 parser.add_argument("--render", action="store_true", help="Render environment")
-args = parser.parse_args()
-args.overshooting_distance = min(
-    args.chunk_size, args.overshooting_distance
-)  # Overshooting distance cannot be greater than chunk size
-print(" " * 26 + "Options")
-for k, v in vars(args).items():
-    print(" " * 26 + k + ": " + str(v))
 
+args = parser.parse_args()
+
+# Overshooting distance cannot be greater than chunk size
+args.overshooting_distance = min(args.chunk_size, args.overshooting_distance)
 
 # Setup
 results_dir = os.path.join("results", "{}_{}".format(args.env, args.id))
 os.makedirs(results_dir, exist_ok=True)
 np.random.seed(args.seed)
 torch.manual_seed(args.seed)
-if torch.cuda.is_available() and not args.disable_cuda:
-    print("using CUDA")
-    args.device = torch.device("cuda")
-    torch.cuda.manual_seed(args.seed)
-else:
-    print("using CPU")
-    args.device = torch.device("cpu")
+args.device = torch.device("cuda")
+torch.cuda.manual_seed(args.seed)
 metrics = {
     "steps": [],
     "episodes": [],
@@ -172,14 +147,17 @@ writer = SummaryWriter(summary_name.format(args.env, args.id))
 
 # Initialise training environment and experience replay memory
 env = Env(args.env, args.symbolic_env, args.seed, args.max_episode_length, args.action_repeat, args.bit_depth)
+
+# Load or initialize experience dataset
 if args.experience_replay != "" and os.path.exists(args.experience_replay):
     D = torch.load(args.experience_replay)
     metrics["steps"], metrics["episodes"] = [D.steps] * D.episodes, list(range(1, D.episodes + 1))
-elif not args.test:
+else:
     D = ExperienceReplay(
         args.experience_size, args.symbolic_env, env.observation_size, env.action_size, args.bit_depth, args.device
     )
     # Initialise dataset D with S random seed episodes
+    # TODO: clean this up
     for s in range(1, args.seed_episodes + 1):
         observation, done, t = env.reset(), False, 0
         while not done:
@@ -192,7 +170,7 @@ elif not args.test:
         metrics["episodes"].append(s)
 
 
-# Initialise model parameters randomly
+# Initialise models
 transition_model = TransitionModel(
     args.belief_size,
     args.state_size,
@@ -221,6 +199,8 @@ actor_model = ActorModel(
 value_model = ValueModel(args.belief_size, args.state_size, args.hidden_size, args.dense_activation_function).to(
     device=args.device
 )
+
+# Set up optimizers
 param_list = (
     list(transition_model.parameters())
     + list(observation_model.parameters())
@@ -242,6 +222,8 @@ value_optimizer = optim.Adam(
     lr=0 if args.learning_rate_schedule != 0 else args.value_learning_rate,
     eps=args.adam_epsilon,
 )
+
+# load models from checkpoint
 if args.models != "" and os.path.exists(args.models):
     model_dicts = torch.load(args.models)
     transition_model.load_state_dict(model_dicts["transition_model"])
@@ -251,24 +233,14 @@ if args.models != "" and os.path.exists(args.models):
     actor_model.load_state_dict(model_dicts["actor_model"])
     value_model.load_state_dict(model_dicts["value_model"])
     model_optimizer.load_state_dict(model_dicts["model_optimizer"])
-if args.algo == "dreamer":
-    print("DREAMER")
-    planner = actor_model
-else:
-    planner = MPCPlanner(
-        env.action_size,
-        args.planning_horizon,
-        args.optimisation_iters,
-        args.candidates,
-        args.top_candidates,
-        transition_model,
-        reward_model,
-    )
+
+planner = actor_model
 global_prior = Normal(
     torch.zeros(args.batch_size, args.state_size, device=args.device),
     torch.ones(args.batch_size, args.state_size, device=args.device),
-)  # Global prior N(0, I)
-free_nats = torch.full((1,), args.free_nats, device=args.device)  # Allowed deviation in KL divergence
+)
+# Allowed deviation in KL divergence
+free_nats = torch.full((1,), args.free_nats, device=args.device)
 
 
 def update_belief_and_act(
@@ -276,64 +248,20 @@ def update_belief_and_act(
 ):
     # Infer belief over current state q(s_t|o≤t,a<t) from the history
     # print("action size: ",action.size()) torch.Size([1, 6])
+    # Action and observation need extra time dimension
     belief, _, _, _, posterior_state, _, _ = transition_model(
         posterior_state, action.unsqueeze(dim=0), belief, encoder(observation).unsqueeze(dim=0)
-    )  # Action and observation need extra time dimension
-    belief, posterior_state = belief.squeeze(dim=0), posterior_state.squeeze(
-        dim=0
-    )  # Remove time dimension from belief/state
-    if args.algo == "dreamer":
-        action = planner.get_action(belief, posterior_state, det=not (explore))
-    else:
-        action = planner(belief, posterior_state)  # Get action from planner(q(s_t|o≤t,a<t), p)
+    )
+    # Remove time dimension from belief/state
+    belief, posterior_state = belief.squeeze(dim=0), posterior_state.squeeze(dim=0)
+    action = planner.get_action(belief, posterior_state, det=not (explore))
     if explore:
-        action = torch.clamp(
-            Normal(action, args.action_noise).rsample(), -1, 1
-        )  # Add gaussian exploration noise on top of the sampled action
+        # Add gaussian exploration noise on top of the sampled action
+        action = torch.clamp(Normal(action, args.action_noise).rsample(), -1, 1)
         # action = action + args.action_noise * torch.randn_like(action)  # Add exploration noise ε ~ p(ε) to the action
-    next_observation, reward, done = env.step(
-        action.cpu() if isinstance(env, EnvBatcher) else action[0].cpu()
-    )  # Perform environment step (action repeats handled internally)
+    # Perform environment step (action repeats handled internally)
+    next_observation, reward, done = env.step(action.cpu() if isinstance(env, EnvBatcher) else action[0].cpu())
     return belief, posterior_state, action, next_observation, reward, done
-
-
-# Testing only
-if args.test:
-    # Set models to eval mode
-    transition_model.eval()
-    reward_model.eval()
-    encoder.eval()
-    with torch.no_grad():
-        total_reward = 0
-        for _ in tqdm(range(args.test_episodes)):
-            observation = env.reset()
-            belief, posterior_state, action = (
-                torch.zeros(1, args.belief_size, device=args.device),
-                torch.zeros(1, args.state_size, device=args.device),
-                torch.zeros(1, env.action_size, device=args.device),
-            )
-            pbar = tqdm(range(args.max_episode_length // args.action_repeat))
-            for t in pbar:
-                belief, posterior_state, action, observation, reward, done = update_belief_and_act(
-                    args,
-                    env,
-                    planner,
-                    transition_model,
-                    encoder,
-                    belief,
-                    posterior_state,
-                    action,
-                    observation.to(device=args.device),
-                )
-                total_reward += reward
-                if args.render:
-                    env.render()
-                if done:
-                    pbar.close()
-                    break
-    print("Average Reward:", total_reward / args.test_episodes)
-    env.close()
-    quit()
 
 
 # Training (and testing)
@@ -347,9 +275,8 @@ for episode in tqdm(
     print("training loop")
     for s in tqdm(range(args.collect_interval)):
         # Draw sequence chunks {(o_t, a_t, r_t+1, terminal_t+1)} ~ D uniformly at random from the dataset (including terminal flags)
-        observations, actions, rewards, nonterminals = D.sample(
-            args.batch_size, args.chunk_size
-        )  # Transitions start at time t = 0
+        # Transitions start at time t = 0
+        observations, actions, rewards, nonterminals = D.sample(args.batch_size, args.chunk_size)
         # Create initial belief and state for time t = 0
         init_belief, init_state = torch.zeros(args.batch_size, args.belief_size, device=args.device), torch.zeros(
             args.batch_size, args.state_size, device=args.device
@@ -366,7 +293,8 @@ for episode in tqdm(
         ) = transition_model(
             init_state, actions[:-1], init_belief, bottle(encoder, (observations[1:],)), nonterminals[:-1]
         )
-        # Calculate observation likelihood, reward likelihood and KL losses (for t = 0 only for latent overshooting); sum over final dims, average over batch and time (original implementation, though paper seems to miss 1/T scaling?)
+        # Calculate observation likelihood, reward likelihood and KL losses (for t = 0 only for latent overshooting);
+        # sum over final dims, average over batch and time (original implementation, though paper seems to miss 1/T scaling?)
         if args.worldmodel_LogProbLoss:
             observation_dist = Normal(bottle(observation_model, (beliefs, posterior_states)), 1)
             observation_loss = (
@@ -391,28 +319,25 @@ for episode in tqdm(
         div = kl_divergence(Normal(posterior_means, posterior_std_devs), Normal(prior_means, prior_std_devs)).sum(
             dim=2
         )
-        kl_loss = torch.max(div, free_nats).mean(
-            dim=(0, 1)
-        )  # Note that normalisation by overshooting distance and weighting by overshooting distance cancel out
+        # Note that normalisation by overshooting distance and weighting by overshooting distance cancel out
+        kl_loss = torch.max(div, free_nats).mean(dim=(0, 1))
         if args.global_kl_beta != 0:
             kl_loss += args.global_kl_beta * kl_divergence(
                 Normal(posterior_means, posterior_std_devs), global_prior
             ).sum(dim=2).mean(dim=(0, 1))
         # Calculate latent overshooting objective for t > 0
         if args.overshooting_kl_beta != 0:
-            overshooting_vars = []  # Collect variables for overshooting to process in batch
+            # Collect variables for overshooting to process in batch
+            overshooting_vars = []
             for t in range(1, args.chunk_size - 1):
-                d = min(t + args.overshooting_distance, args.chunk_size - 1)  # Overshooting distance
-                t_, d_ = t - 1, d - 1  # Use t_ and d_ to deal with different time indexing for latent states
-                seq_pad = (
-                    0,
-                    0,
-                    0,
-                    0,
-                    0,
-                    t - d + args.overshooting_distance,
-                )  # Calculate sequence padding so overshooting terms can be calculated in one batch
+                # Overshooting distance
+                d = min(t + args.overshooting_distance, args.chunk_size - 1)
+                # Use t_ and d_ to deal with different time indexing for latent states
+                t_, d_ = t - 1, d - 1
+                # Calculate sequence padding so overshooting terms can be calculated in one batch
+                seq_pad = (0, 0, 0, 0, 0, t - d + args.overshooting_distance)
                 # Store (0) actions, (1) nonterminals, (2) rewards, (3) beliefs, (4) prior states, (5) posterior means, (6) posterior standard deviations and (7) sequence masks
+                # Posterior standard deviations must be padded with > 0 to prevent infinite KL divergences
                 overshooting_vars.append(
                     (
                         F.pad(actions[t:d], seq_pad),
@@ -424,7 +349,7 @@ for episode in tqdm(
                         F.pad(posterior_std_devs[t_ + 1 : d_ + 1].detach(), seq_pad, value=1),
                         F.pad(torch.ones(d - t, args.batch_size, args.state_size, device=args.device), seq_pad),
                     )
-                )  # Posterior standard deviations must be padded with > 0 to prevent infinite KL divergences
+                )
             overshooting_vars = tuple(zip(*overshooting_vars))
             # Update belief/state using prior from previous belief/state and previous action (over entire sequence at once)
             beliefs, prior_states, prior_means, prior_std_devs = transition_model(
@@ -436,6 +361,7 @@ for episode in tqdm(
             )
             seq_mask = torch.cat(overshooting_vars[7], dim=1)
             # Calculate overshooting KL loss with sequence mask
+            # Update KL loss (compensating for extra average over each overshooting/open loop sequence)
             kl_loss += (
                 (1 / args.overshooting_distance)
                 * args.overshooting_kl_beta
@@ -450,8 +376,9 @@ for episode in tqdm(
                     free_nats,
                 ).mean(dim=(0, 1))
                 * (args.chunk_size - 1)
-            )  # Update KL loss (compensating for extra average over each overshooting/open loop sequence)
+            )
             # Calculate overshooting reward prediction loss with sequence mask
+            # Update reward loss (compensating for extra average over each overshooting/open loop sequence)
             if args.overshooting_reward_scale != 0:
                 reward_loss += (
                     (1 / args.overshooting_distance)
@@ -462,7 +389,7 @@ for episode in tqdm(
                         reduction="none",
                     ).mean(dim=(0, 1))
                     * (args.chunk_size - 1)
-                )  # Update reward loss (compensating for extra average over each overshooting/open loop sequence)
+                )
         # Apply linearly ramping learning rate schedule
         if args.learning_rate_schedule != 0:
             for group in model_optimizer.param_groups:
@@ -504,9 +431,8 @@ for episode in tqdm(
             value_beliefs = imged_beliefs.detach()
             value_prior_states = imged_prior_states.detach()
             target_return = returns.detach()
-        value_dist = Normal(
-            bottle(value_model, (value_beliefs, value_prior_states)), 1
-        )  # detach the input tensor from the transition network.
+        # detach the input tensor from the transition network.
+        value_dist = Normal(bottle(value_model, (value_beliefs, value_prior_states)), 1)
         value_loss = -value_dist.log_prob(target_return).mean(dim=(0, 1))
         # Update model parameters
         value_optimizer.zero_grad()
@@ -514,7 +440,7 @@ for episode in tqdm(
         nn.utils.clip_grad_norm_(value_model.parameters(), args.grad_clip_norm, norm_type=2)
         value_optimizer.step()
 
-        # # Store (0) observation loss (1) reward loss (2) KL loss (3) actor loss (4) value loss
+        # Store (0) observation loss (1) reward loss (2) KL loss (3) actor loss (4) value loss
         losses.append(
             [observation_loss.item(), reward_loss.item(), kl_loss.item(), actor_loss.item(), value_loss.item()]
         )
@@ -621,12 +547,13 @@ for episode in tqdm(
                 )
                 total_rewards += reward.numpy()
                 if not args.symbolic_env:  # Collect real vs. predicted frames for video
+                    # Decentre
                     video_frames.append(
                         make_grid(
                             torch.cat([observation, observation_model(belief, posterior_state).cpu()], dim=3) + 0.5,
                             nrow=5,
                         ).numpy()
-                    )  # Decentre
+                    )
                 observation = next_observation
                 if done.sum().item() == args.test_episodes:
                     pbar.close()
@@ -691,9 +618,8 @@ for episode in tqdm(
             os.path.join(results_dir, "models_%d.pth" % episode),
         )
         if args.checkpoint_experience:
-            torch.save(
-                D, os.path.join(results_dir, "experience.pth")
-            )  # Warning: will fail with MemoryError with large memory sizes
+            # Warning: will fail with MemoryError with large memory sizes
+            torch.save(D, os.path.join(results_dir, "experience.pth"))
 
 
 # Close training environment

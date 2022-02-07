@@ -88,12 +88,10 @@ class TransitionModel(jit.ScriptModule):
         beliefs[0], prior_states[0], posterior_states[0] = prev_belief, prev_state, prev_state
         # Loop over time sequence
         for t in range(T - 1):
-            _state = (
-                prior_states[t] if observations is None else posterior_states[t]
-            )  # Select appropriate previous state
-            _state = (
-                _state if nonterminals is None else _state * nonterminals[t]
-            )  # Mask if previous transition was terminal
+            # Select appropriate previous state
+            _state = prior_states[t] if observations is None else posterior_states[t]
+            # Mask if previous transition was terminal
+            _state = _state if nonterminals is None else _state * nonterminals[t]
             # Compute belief (deterministic hidden state)
             hidden = self.act_fn(self.fc_embed_state_action(torch.cat([_state, actions[t]], dim=1)))
             beliefs[t + 1] = self.rnn(hidden, beliefs[t])
@@ -104,7 +102,8 @@ class TransitionModel(jit.ScriptModule):
             prior_states[t + 1] = prior_means[t + 1] + prior_std_devs[t + 1] * torch.randn_like(prior_means[t + 1])
             if observations is not None:
                 # Compute state posterior by applying transition dynamics and using current observation
-                t_ = t - 1  # Use t_ to deal with different time indexing for observations
+                # Use t_ to deal with different time indexing for observations
+                t_ = t - 1
                 hidden = self.act_fn(
                     self.fc_embed_belief_posterior(torch.cat([beliefs[t + 1], observations[t_ + 1]], dim=1))
                 )
@@ -162,7 +161,8 @@ class VisualObservationModel(jit.ScriptModule):
 
     @jit.script_method
     def forward(self, belief, state):
-        hidden = self.fc1(torch.cat([belief, state], dim=1))  # No nonlinearity here
+        # No nonlinearity here
+        hidden = self.fc1(torch.cat([belief, state], dim=1))
         hidden = hidden.view(-1, self.embedding_size, 1, 1)
         hidden = self.act_fn(self.conv1(hidden))
         hidden = self.act_fn(self.conv2(hidden))
