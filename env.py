@@ -45,32 +45,37 @@ CONTROL_SUITE_ACTION_REPEATS = {
 
 
 # Preprocesses an observation inplace (from float32 Tensor [0, 255] to [-0.5, 0.5])
-def preprocess_observation_(observation, bit_depth):
-    observation.div_(2 ** (8 - bit_depth)).floor_().div_(2**bit_depth).sub_(
-        0.5
-    )  # Quantise to given bit depth and centre
-    observation.add_(
-        torch.rand_like(observation).div_(2**bit_depth)
-    )  # Dequantise (to approx. match likelihood of PDF of continuous images vs. PMF of discrete images)
+def preprocess_observation(observation):
+    # TODO: make sure this makes sense
+    return observation / 255.0 - 0.5
+
+    # observation.div_(2 ** (8 - bit_depth)).floor_().div_(2**bit_depth).sub_(
+    #     0.5
+    # )  # Quantise to given bit depth and centre
+    # observation.add_(
+    #     torch.rand_like(observation).div_(2**bit_depth)
+    # )  # Dequantise (to approx. match likelihood of PDF of continuous images vs. PMF of discrete images)
 
 
 # Postprocess an observation for storage (from float32 numpy array [-0.5, 0.5] to uint8 numpy array [0, 255])
-def postprocess_observation(observation, bit_depth):
-    return np.clip(np.floor((observation + 0.5) * 2**bit_depth) * 2 ** (8 - bit_depth), 0, 2**8 - 1).astype(
-        np.uint8
-    )
+def postprocess_observation(observation):
+    # TODO: make sure this makes sense
+    # return np.clip(np.floor((observation + 0.5) * 2**bit_depth) * 2 ** (8 - bit_depth), 0, 2**8 - 1).astype(
+    #     np.uint8
+    # )
+    return ((observation + .5) * 255.0).astype(np.uint8)
 
 
-def _images_to_observation(images, bit_depth):
+def _images_to_observation(images):
     images = torch.tensor(
         cv2.resize(images, (64, 64), interpolation=cv2.INTER_LINEAR).transpose(2, 0, 1), dtype=torch.float32
     )  # Resize and put channel first
-    preprocess_observation_(images, bit_depth)  # Quantise, centre and dequantise inplace
+    images = preprocess_observation(images)  # Quantise, centre and dequantise inplace
     return images.unsqueeze(dim=0)  # Add batch dimension
 
 
 class ControlSuiteEnv:
-    def __init__(self, env, symbolic, seed, max_episode_length, action_repeat, bit_depth):
+    def __init__(self, env, symbolic, seed, max_episode_length, action_repeat):
         from dm_control import suite
         from dm_control.suite.wrappers import pixels
 
@@ -86,7 +91,6 @@ class ControlSuiteEnv:
                 "Using action repeat %d; recommended action repeat for domain is %d"
                 % (action_repeat, CONTROL_SUITE_ACTION_REPEATS[domain])
             )
-        self.bit_depth = bit_depth
 
     def reset(self):
         self.t = 0  # Reset internal timer
@@ -100,7 +104,7 @@ class ControlSuiteEnv:
                 dtype=torch.float32,
             ).unsqueeze(dim=0)
         else:
-            return _images_to_observation(self._env.physics.render(camera_id=0), self.bit_depth)
+            return _images_to_observation(self._env.physics.render(camera_id=0))
 
     def step(self, action):
         action = action.detach().numpy()
@@ -121,7 +125,7 @@ class ControlSuiteEnv:
                 dtype=torch.float32,
             ).unsqueeze(dim=0)
         else:
-            observation = _images_to_observation(self._env.physics.render(camera_id=0), self.bit_depth)
+            observation = _images_to_observation(self._env.physics.render(camera_id=0))
         return observation, reward, done
 
     def render(self):
@@ -151,7 +155,7 @@ class ControlSuiteEnv:
 
 
 class GymEnv:
-    def __init__(self, env, symbolic, seed, max_episode_length, action_repeat, bit_depth):
+    def __init__(self, env, symbolic, seed, max_episode_length, action_repeat):
         import gym
 
         self.symbolic = symbolic
@@ -159,7 +163,6 @@ class GymEnv:
         self._env.seed(seed)
         self.max_episode_length = max_episode_length
         self.action_repeat = action_repeat
-        self.bit_depth = bit_depth
 
     def reset(self):
         self.t = 0  # Reset internal timer
@@ -167,7 +170,7 @@ class GymEnv:
         if self.symbolic:
             return torch.tensor(state, dtype=torch.float32).unsqueeze(dim=0)
         else:
-            return _images_to_observation(self._env.render(mode="rgb_array"), self.bit_depth)
+            return _images_to_observation(self._env.render(mode="rgb_array"))
 
     def step(self, action):
         action = action.detach().numpy()
@@ -182,7 +185,7 @@ class GymEnv:
         if self.symbolic:
             observation = torch.tensor(state, dtype=torch.float32).unsqueeze(dim=0)
         else:
-            observation = _images_to_observation(self._env.render(mode="rgb_array"), self.bit_depth)
+            observation = _images_to_observation(self._env.render(mode="rgb_array"))
         return observation, reward, done
 
     def render(self):
@@ -204,11 +207,11 @@ class GymEnv:
         return torch.from_numpy(self._env.action_space.sample())
 
 
-def Env(env, symbolic, seed, max_episode_length, action_repeat, bit_depth):
+def Env(env, symbolic, seed, max_episode_length, action_repeat):
     if env in GYM_ENVS:
-        return GymEnv(env, symbolic, seed, max_episode_length, action_repeat, bit_depth)
+        return GymEnv(env, symbolic, seed, max_episode_length, action_repeat)
     elif env in CONTROL_SUITE_ENVS:
-        return ControlSuiteEnv(env, symbolic, seed, max_episode_length, action_repeat, bit_depth)
+        return ControlSuiteEnv(env, symbolic, seed, max_episode_length, action_repeat)
 
 
 # Wrapper for batching environments together

@@ -5,17 +5,17 @@ from tqdm import tqdm
 
 from env import Env
 from env import EnvBatcher
-from main import update_belief_and_act
+from stuff import update_belief_and_act
 
 
-def test(args, models, metrics):
+def test(args, models):
     models = [model.eval() for model in models]
     transition_model, observation_model, reward_model, encoder, actor_model, value_model = models
 
     # Initialise parallelised test environments
     test_envs = EnvBatcher(
         Env,
-        (args.env, args.symbolic_env, args.seed, args.max_episode_length, args.action_repeat, args.bit_depth),
+        (args.env, args.symbolic_env, args.seed, args.max_episode_length, args.action_repeat),
         {},
         args.test_episodes,
     )
@@ -56,7 +56,7 @@ def test(args, models, metrics):
 
     # Update and plot reward metrics (and write video if applicable) and save metrics
     # metrics["test_episodes"].append(episode)
-    metrics["test_rewards"].append(total_rewards.tolist())
+    # metrics["test_rewards"].append(total_rewards.tolist())
     # lineplot(metrics["test_episodes"], metrics["test_rewards"], "test_rewards", results_dir)
     # lineplot(
     #     np.asarray(metrics["steps"])[np.asarray(metrics["test_episodes"]) - 1],
@@ -75,3 +75,6 @@ def test(args, models, metrics):
     [model.train() for model in models]
     # Close test environments
     test_envs.close()
+
+    # total_rewards should be a list of shape (batch_size, )?
+    return total_rewards

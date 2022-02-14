@@ -7,11 +7,12 @@ from torch.nn import functional as F
 
 def imagine_ahead(prev_state, prev_belief, policy, transition_model, planning_horizon=12):
     """
-    imagine_ahead is the function to draw the imaginary tracjectory using the dynamics model, actor, critic.
+    imagine_ahead is the function to draw the imaginary trajectory using the dynamics model, actor, critic.
     Input: current state (posterior), current belief (hidden), policy, transition_model  # torch.Size([50, 30]) torch.Size([50, 200])
     Output: generated trajectory of features includes beliefs, prior_states, prior_means, prior_std_devs
             torch.Size([49, 50, 200]) torch.Size([49, 50, 30]) torch.Size([49, 50, 30]) torch.Size([49, 50, 30])
     """
+    # TODO: replace with reshape
     flatten = lambda x: x.view([-1] + list(x.size()[2:]))
     prev_belief = flatten(prev_belief)
     prev_state = flatten(prev_state)
@@ -30,14 +31,20 @@ def imagine_ahead(prev_state, prev_belief, policy, transition_model, planning_ho
     for t in range(T - 1):
         _state = prior_states[t]
         actions = policy.get_action(beliefs[t].detach(), _state.detach())
+
+        # TODO: this should get deduped with the code in the transition model
+        # But basically what's happening is that we're computing actions with detached latents,
+        # and rolling out a new imagined trajectory using just the prior model
+
         # Compute belief (deterministic hidden state)
-        hidden = transition_model.act_fn(transition_model.fc_embed_state_action(torch.cat([_state, actions], dim=1)))
+        hidden = F.elu(transition_model.fc_embed_state_action(torch.cat([_state, actions], dim=1)))
         beliefs[t + 1] = transition_model.rnn(hidden, beliefs[t])
         # Compute state prior by applying transition dynamics
-        hidden = transition_model.act_fn(transition_model.fc_embed_belief_prior(beliefs[t + 1]))
+        hidden = F.elu(transition_model.fc_embed_belief_prior(beliefs[t + 1]))
         prior_means[t + 1], _prior_std_dev = torch.chunk(transition_model.fc_state_prior(hidden), 2, dim=1)
         prior_std_devs[t + 1] = F.softplus(_prior_std_dev) + transition_model.min_std_dev
         prior_states[t + 1] = prior_means[t + 1] + prior_std_devs[t + 1] * torch.randn_like(prior_means[t + 1])
+
     # Return new hidden states
     # imagined_traj = [beliefs, prior_states, prior_means, prior_std_devs]
     imagined_traj = [

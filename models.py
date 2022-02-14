@@ -1,9 +1,11 @@
-from typing import List
+from typing import List, Tuple
 from typing import Optional
+from torch import Tensor
 
 import numpy as np
 import torch
 import torch.distributions
+from einops import rearrange
 from torch import jit
 from torch import nn
 from torch.distributions.normal import Normal
@@ -11,13 +13,14 @@ from torch.distributions.transformed_distribution import TransformedDistribution
 from torch.nn import functional as F
 
 
-# Wraps the input tuple for a function to process a time x batch x features sequence in batch x features (assumes one output)
 def bottle(f, x_tuple):
-    x_sizes = tuple(map(lambda x: x.size(), x_tuple))
-    y = f(*map(lambda x: x[0].view(x[1][0] * x[1][1], *x[1][2:]), zip(x_tuple, x_sizes)))
-    y_size = y.size()
-    output = y.view(x_sizes[0][0], x_sizes[0][1], *y_size[1:])
-    return output
+    """Adapts inputs with shape (T, B, ...) to work with a function f expecting shape (B, ...).
+
+    TODO: this might be clearer as a function wrapper."""
+    T, B = x_tuple[0].shape[:2]
+    x_tuple = (rearrange(x, "t b ... -> (t b) ...", t=T, b=B) for x in x_tuple)
+    y = f(*x_tuple)
+    return rearrange(y, "(t b) ... -> t b ...", t=T, b=B)
 
 
 class TransitionModel(jit.ScriptModule):
@@ -34,7 +37,6 @@ class TransitionModel(jit.ScriptModule):
         min_std_dev=0.1,
     ):
         super().__init__()
-        self.act_fn = getattr(F, activation_function)
         self.min_std_dev = min_std_dev
         self.fc_embed_state_action = nn.Linear(state_size + action_size, belief_size)
         self.rnn = nn.GRUCell(belief_size, belief_size)
@@ -60,16 +62,108 @@ class TransitionModel(jit.ScriptModule):
     # ps: -X-
     # b : -x--X--X--X--X--X-
     # s : -x--X--X--X--X--X-
-    @jit.script_method
+    # @jit.script_method
+    # def forward(
+    #     self,
+    #     prev_state: torch.Tensor,
+    #     actions: torch.Tensor,
+    #     prev_belief: torch.Tensor,
+    #     enc_observations: torch.Tensor,
+    #     nonterminals: torch.Tensor,
+    # ):
+    #     """
+    #     Computes transitions for an entire sequence.
+    #     If enc_observations is given, "training mode" is used where the state posterior is the base of the next
+    #     timestep. Else, in "test mode", the prior is rolled out.
+    #
+    #     Input: init_belief, init_state:  torch.Size([50, 200]) torch.Size([50, 30])
+    #     Output: beliefs, prior_states, prior_means, prior_std_devs, posterior_states, posterior_means, posterior_std_devs
+    #             torch.Size([49, 50, 200]) torch.Size([49, 50, 30]) torch.Size([49, 50, 30]) torch.Size([49, 50, 30]) torch.Size([49, 50, 30]) torch.Size([49, 50, 30]) torch.Size([49, 50, 30])
+    #     """
+    #     # Create lists for hidden states (cannot use single tensor as buffer because autograd won't work with inplace writes)
+    #     T = actions.size(0) + 1
+    #     # beliefs, prior_states, prior_means, prior_std_devs, posterior_states, posterior_means, posterior_std_devs = (
+    #     #     [torch.empty(0)] * T,
+    #     #     [torch.empty(0)] * T,
+    #     #     [torch.empty(0)] * T,
+    #     #     [torch.empty(0)] * T,
+    #     #     [torch.empty(0)] * T,
+    #     #     [torch.empty(0)] * T,
+    #     #     [torch.empty(0)] * T,
+    #     # )
+    #
+    #     beliefs = []
+    #     posterior_means = []
+    #     posterior_std_devs = []
+    #     posterior_states = []
+    #
+    #     beliefs.append(prev_belief)
+    #     posterior_states.append(prev_state)
+    #
+    #     # beliefs[0], prior_states[0], posterior_states[0] = prev_belief, prev_state, prev_state
+    #     # for t in range(T - 1):
+    #     for t in range(10):
+    #         # Select appropriate previous state
+    #         _state = posterior_states[-1]
+    #         # Set _state to 0 if previous transition was terminal
+    #         _state = _state * nonterminals[t]
+    #
+    #         # Compute belief (deterministic hidden state)
+    #         # This if f in the paper.
+    #         # "beliefs" is h_t in the paper
+    #         hidden = F.elu(self.fc_embed_state_action(torch.cat((_state, actions[t]), dim=1)))
+    #         belief = self.rnn(hidden, beliefs[-1])
+    #
+    #         # Compute state prior by applying transition dynamics.
+    #         # This is the "stochastic state model" or "prior" in the paper
+    #         # The prior has no info on the actual observation.
+    #         # TODO: pull this out of the loop and batch it all at the end
+    #         # hidden = F.elu(self.fc_embed_belief_prior(beliefs[t + 1]))
+    #         # prior_means[t + 1], _prior_std_dev = torch.chunk(self.fc_state_prior(hidden), 2, dim=1)
+    #         # prior_std_devs[t + 1] = F.softplus(_prior_std_dev) + self.min_std_dev
+    #         # prior_states[t + 1] = prior_means[t + 1] + prior_std_devs[t + 1] * torch.randn_like(prior_means[t + 1])
+    #
+    #         # Compute state posterior by applying transition dynamics and using current observation
+    #         # This is the "encoder" or "posterior" in the paper
+    #         # The posterior differs from the prior in that it also sees the observation.
+    #         # Use t_ to deal with different time indexing for observations
+    #         t_ = t - 1
+    #         hidden = F.elu(
+    #             self.fc_embed_belief_posterior(torch.cat([belief, enc_observations[t_ + 1]], dim=1))
+    #         )
+    #         posterior_mean, _posterior_std_dev = torch.chunk(self.fc_state_posterior(hidden), 2, dim=1)
+    #         posterior_std_dev = F.softplus(_posterior_std_dev) + self.min_std_dev
+    #         posterior_state = posterior_mean + posterior_std_dev #* torch.randn_like(posterior_mean)
+    #
+    #         posterior_states.append(posterior_state)
+    #         posterior_means.append(posterior_mean)
+    #         posterior_std_devs.append(posterior_std_dev)
+    #         beliefs.append(belief)
+    #
+    #     # Return new hidden states
+    #     return (
+    #         torch.stack(beliefs[1:], dim=0),
+    #         # torch.stack(prior_states[1:], dim=0),
+    #         # torch.stack(prior_means[1:], dim=0),
+    #         # torch.stack(prior_std_devs[1:], dim=0),
+    #         torch.stack(posterior_states[1:], dim=0),
+    #         torch.stack(posterior_means[1:], dim=0),
+    #         torch.stack(posterior_std_devs[1:], dim=0),
+    #     )
+
     def forward(
-        self,
-        prev_state: torch.Tensor,
-        actions: torch.Tensor,
-        prev_belief: torch.Tensor,
-        observations: Optional[torch.Tensor] = None,
-        nonterminals: Optional[torch.Tensor] = None,
+            self,
+            prev_state: torch.Tensor,
+            actions: torch.Tensor,
+            prev_belief: torch.Tensor,
+            enc_observations: Optional[torch.Tensor] = None,
+            nonterminals: Optional[torch.Tensor] = None,
     ) -> List[torch.Tensor]:
         """
+        Computes transitions for an entire sequence.
+        If enc_observations is given, "training mode" is used where the state posterior is the base of the next
+        timestep. Else, in "test mode", the prior is rolled out.
+
         Input: init_belief, init_state:  torch.Size([50, 200]) torch.Size([50, 30])
         Output: beliefs, prior_states, prior_means, prior_std_devs, posterior_states, posterior_means, posterior_std_devs
                 torch.Size([49, 50, 200]) torch.Size([49, 50, 30]) torch.Size([49, 50, 30]) torch.Size([49, 50, 30]) torch.Size([49, 50, 30]) torch.Size([49, 50, 30]) torch.Size([49, 50, 30])
@@ -86,26 +180,34 @@ class TransitionModel(jit.ScriptModule):
             [torch.empty(0)] * T,
         )
         beliefs[0], prior_states[0], posterior_states[0] = prev_belief, prev_state, prev_state
-        # Loop over time sequence
         for t in range(T - 1):
             # Select appropriate previous state
-            _state = prior_states[t] if observations is None else posterior_states[t]
-            # Mask if previous transition was terminal
+            _state = prior_states[t] if enc_observations is None else posterior_states[t]
+            # Set _state to 0 if previous transition was terminal
             _state = _state if nonterminals is None else _state * nonterminals[t]
+
             # Compute belief (deterministic hidden state)
-            hidden = self.act_fn(self.fc_embed_state_action(torch.cat([_state, actions[t]], dim=1)))
+            # This if f in the paper.
+            # "beliefs" is h_t in the paper
+            hidden = F.elu(self.fc_embed_state_action(torch.cat([_state, actions[t]], dim=1)))
             beliefs[t + 1] = self.rnn(hidden, beliefs[t])
-            # Compute state prior by applying transition dynamics
-            hidden = self.act_fn(self.fc_embed_belief_prior(beliefs[t + 1]))
+
+            # Compute state prior by applying transition dynamics.
+            # This is the "stochastic state model" or "prior" in the paper
+            # The prior has no info on the actual observation.
+            hidden = F.elu(self.fc_embed_belief_prior(beliefs[t + 1]))
             prior_means[t + 1], _prior_std_dev = torch.chunk(self.fc_state_prior(hidden), 2, dim=1)
             prior_std_devs[t + 1] = F.softplus(_prior_std_dev) + self.min_std_dev
             prior_states[t + 1] = prior_means[t + 1] + prior_std_devs[t + 1] * torch.randn_like(prior_means[t + 1])
-            if observations is not None:
+
+            if enc_observations is not None:
                 # Compute state posterior by applying transition dynamics and using current observation
+                # This is the "encoder" or "posterior" in the paper
+                # The posterior differs from the prior in that it also sees the observation.
                 # Use t_ to deal with different time indexing for observations
                 t_ = t - 1
-                hidden = self.act_fn(
-                    self.fc_embed_belief_posterior(torch.cat([beliefs[t + 1], observations[t_ + 1]], dim=1))
+                hidden = F.elu(
+                    self.fc_embed_belief_posterior(torch.cat([beliefs[t + 1], enc_observations[t_ + 1]], dim=1))
                 )
                 posterior_means[t + 1], _posterior_std_dev = torch.chunk(self.fc_state_posterior(hidden), 2, dim=1)
                 posterior_std_devs[t + 1] = F.softplus(_posterior_std_dev) + self.min_std_dev
@@ -119,14 +221,13 @@ class TransitionModel(jit.ScriptModule):
             torch.stack(prior_means[1:], dim=0),
             torch.stack(prior_std_devs[1:], dim=0),
         ]
-        if observations is not None:
+        if enc_observations is not None:
             hidden += [
                 torch.stack(posterior_states[1:], dim=0),
                 torch.stack(posterior_means[1:], dim=0),
                 torch.stack(posterior_std_devs[1:], dim=0),
             ]
         return hidden
-
 
 class SymbolicObservationModel(jit.ScriptModule):
     def __init__(self, observation_size, belief_size, state_size, embedding_size, activation_function="relu"):
@@ -255,12 +356,14 @@ class ActorModel(jit.ScriptModule):
         action = self.fc5(hidden).squeeze(dim=1)
 
         action_mean, action_std_dev = torch.chunk(action, 2, dim=1)
+        # TODO: why tanh here? are the valid actions in (-1, 1)? probably
         action_mean = self._mean_scale * torch.tanh(action_mean / self._mean_scale)
         action_std = F.softplus(action_std_dev + raw_init_std) + self._min_std
         return action_mean, action_std
 
     def get_action(self, belief, state, det=False):
         action_mean, action_std = self.forward(belief, state)
+        # TODO: understand+simplify this
         dist = Normal(action_mean, action_std)
         dist = TransformedDistribution(dist, TanhBijector())
         dist = torch.distributions.Independent(dist, 1)
@@ -288,6 +391,7 @@ class SymbolicEncoder(jit.ScriptModule):
         return hidden
 
 
+# TODO: isn't the encoder supposed to have a sampling step?
 class VisualEncoder(jit.ScriptModule):
     __constants__ = ["embedding_size"]
 
@@ -299,6 +403,7 @@ class VisualEncoder(jit.ScriptModule):
         self.conv2 = nn.Conv2d(32, 64, 4, stride=2)
         self.conv3 = nn.Conv2d(64, 128, 4, stride=2)
         self.conv4 = nn.Conv2d(128, 256, 4, stride=2)
+        # TODO: huh
         self.fc = nn.Identity() if embedding_size == 1024 else nn.Linear(1024, embedding_size)
         self.modules = [self.conv1, self.conv2, self.conv3, self.conv4]
 

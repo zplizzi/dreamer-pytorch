@@ -14,7 +14,6 @@ from tqdm import tqdm
 from env import CONTROL_SUITE_ENVS
 from env import GYM_ENVS
 from env import Env
-from env import EnvBatcher
 from memory import ExperienceReplay
 from models import ActorModel
 from models import Encoder
@@ -23,10 +22,12 @@ from models import RewardModel
 from models import TransitionModel
 from models import ValueModel
 from models import bottle
-from tensorboardX import SummaryWriter
 from utils import FreezeParameters
 from utils import imagine_ahead
 from utils import lambda_return
+
+from util import wandb_lib
+from stuff import update_belief_and_act
 
 # Hyperparameters
 parser = argparse.ArgumentParser()
@@ -58,6 +59,7 @@ parser.add_argument("--seed-episodes", type=int, default=5, metavar="S", help="S
 parser.add_argument("--collect-interval", type=int, default=100, metavar="C", help="Collect interval")
 parser.add_argument("--batch-size", type=int, default=50, metavar="B", help="Batch size")
 parser.add_argument("--chunk-size", type=int, default=50, metavar="L", help="Chunk size")
+# TODO: shouldn't this be enabled by default?
 parser.add_argument(
     "--worldmodel-LogProbLoss",
     action="store_true",
@@ -92,31 +94,20 @@ np.random.seed(args.seed)
 torch.manual_seed(args.seed)
 args.device = torch.device("cuda")
 torch.cuda.manual_seed(args.seed)
-metrics = {
-    "steps": [],
-    "episodes": [],
-    "train_rewards": [],
-    "test_episodes": [],
-    "test_rewards": [],
-    "observation_loss": [],
-    "reward_loss": [],
-    "kl_loss": [],
-    "actor_loss": [],
-    "value_loss": [],
-}
-
-summary_name = results_dir + "/{}_{}_log"
-writer = SummaryWriter(summary_name.format(args.env, args.id))
 
 # Initialise training environment and experience replay memory
-env = Env(args.env, args.symbolic_env, args.seed, args.max_episode_length, args.action_repeat, args.bit_depth)
+env = Env(args.env, args.symbolic_env, args.seed, args.max_episode_length, args.action_repeat)
+
+environment_steps = 0
+training_steps = 0
 
 # initialize experience dataset
 D = ExperienceReplay(
-    args.experience_size, args.symbolic_env, env.observation_size, env.action_size, args.bit_depth, args.device
+    args.experience_size, args.symbolic_env, env.observation_size, env.action_size, args.device
 )
 # Initialise dataset D with S random seed episodes
 # TODO: clean this up
+print("building initial dataset")
 for s in range(1, args.seed_episodes + 1):
     observation, done, t = env.reset(), False, 0
     while not done:
@@ -125,11 +116,12 @@ for s in range(1, args.seed_episodes + 1):
         D.append(observation, action, reward, done)
         observation = next_observation
         t += 1
-    metrics["steps"].append(t * args.action_repeat + (0 if len(metrics["steps"]) == 0 else metrics["steps"][-1]))
-    metrics["episodes"].append(s)
+        environment_steps += 1
+print("done")
 
 
 # Initialise models
+print("initializing models")
 transition_model = TransitionModel(
     args.belief_size,
     args.state_size,
@@ -170,6 +162,7 @@ value_optimizer = optim.Adam(value_model.parameters(), lr=args.value_learning_ra
 
 # load models from checkpoint
 if args.models != "" and os.path.exists(args.models):
+    print("loading models from checkpoint")
     model_dicts = torch.load(args.models)
     transition_model.load_state_dict(model_dicts["transition_model"])
     observation_model.load_state_dict(model_dicts["observation_model"])
@@ -186,32 +179,14 @@ global_prior = Normal(
 # Allowed deviation in KL divergence
 free_nats = torch.full((1,), args.free_nats, device=args.device)
 
-
-def update_belief_and_act(
-    args, env, actor_model, transition_model, encoder, belief, posterior_state, action, observation, explore=False
-):
-    # Infer belief over current state q(s_t|o≤t,a<t) from the history
-    # print("action size: ",action.size()) torch.Size([1, 6])
-    # Action and observation need extra time dimension
-    belief, _, _, _, posterior_state, _, _ = transition_model(
-        posterior_state, action.unsqueeze(dim=0), belief, encoder(observation).unsqueeze(dim=0)
-    )
-    # Remove time dimension from belief/state
-    belief, posterior_state = belief.squeeze(dim=0), posterior_state.squeeze(dim=0)
-    action = actor_model.get_action(belief, posterior_state, det=not (explore))
-    if explore:
-        # Add gaussian exploration noise on top of the sampled action
-        action = torch.clamp(Normal(action, args.action_noise).rsample(), -1, 1)
-        # action = action + args.action_noise * torch.randn_like(action)  # Add exploration noise ε ~ p(ε) to the action
-    # Perform environment step (action repeats handled internally)
-    next_observation, reward, done = env.step(action.cpu() if isinstance(env, EnvBatcher) else action[0].cpu())
-    return belief, posterior_state, action, next_observation, reward, done
+# Set up wandb logging
+import wandb
+wandb.init(project="zack_dreamer", config=args)
+# wandb.require(experiment="service")
 
 
 # Training (and testing)
-for episode in tqdm(
-    range(metrics["episodes"][-1] + 1, args.episodes + 1), total=args.episodes, initial=metrics["episodes"][-1] + 1
-):
+for episode in tqdm(range(args.episodes)):
     # Model fitting
     losses = []
     model_modules = transition_model.modules + encoder.modules + observation_model.modules + reward_model.modules
@@ -222,10 +197,10 @@ for episode in tqdm(
         # Transitions start at time t = 0
         observations, actions, rewards, nonterminals = D.sample(args.batch_size, args.chunk_size)
         # Create initial belief and state for time t = 0
-        init_belief, init_state = torch.zeros(args.batch_size, args.belief_size, device=args.device), torch.zeros(
-            args.batch_size, args.state_size, device=args.device
-        )
+        init_belief = torch.zeros(args.batch_size, args.belief_size, device=args.device)
+        init_state = torch.zeros(args.batch_size, args.state_size, device=args.device)
         # Update belief/state using posterior from previous belief/state, previous action and current observation (over entire sequence at once)
+        encoded_observations = bottle(encoder, (observations[1:],))
         (
             beliefs,
             prior_states,
@@ -234,56 +209,63 @@ for episode in tqdm(
             posterior_states,
             posterior_means,
             posterior_std_devs,
-        ) = transition_model(
-            init_state, actions[:-1], init_belief, bottle(encoder, (observations[1:],)), nonterminals[:-1]
-        )
+        ) = transition_model(init_state, actions[:-1], init_belief, encoded_observations, nonterminals[:-1])
+
+        # TODO: what does this comment mean?
         # Calculate observation likelihood, reward likelihood and KL losses (for t = 0 only for latent overshooting);
-        # sum over final dims, average over batch and time (original implementation, though paper seems to miss 1/T scaling?)
+
+        ## RSSM losses + training step
+
+        # Reconstruction loss - based on posterior
+        obs_prediction = bottle(observation_model, (beliefs, posterior_states))
         if args.worldmodel_LogProbLoss:
-            observation_dist = Normal(bottle(observation_model, (beliefs, posterior_states)), 1)
-            observation_loss = (
-                -observation_dist.log_prob(observations[1:])
-                .sum(dim=2 if args.symbolic_env else (2, 3, 4))
-                .mean(dim=(0, 1))
-            )
+            observation_dist = Normal(obs_prediction, 1)
+            log_prob = observation_dist.log_prob(observations[1:])
+            observation_loss = -log_prob.sum(dim=2 if args.symbolic_env else (2, 3, 4)).mean(dim=(0, 1))
         else:
             observation_loss = (
-                F.mse_loss(bottle(observation_model, (beliefs, posterior_states)), observations[1:], reduction="none")
+                F.mse_loss(obs_prediction, observations[1:], reduction="none")
                 .sum(dim=2 if args.symbolic_env else (2, 3, 4))
                 .mean(dim=(0, 1))
             )
+
+        # Reward loss - based on posterior
+        reward_preds = bottle(reward_model, (beliefs, posterior_states))
         if args.worldmodel_LogProbLoss:
-            reward_dist = Normal(bottle(reward_model, (beliefs, posterior_states)), 1)
+            # TODO: https://github.com/yusukeurakami/dreamer-pytorch/issues/5
+            # The author thinks it should be rewards[1:] instead of [:-1]
+            reward_dist = Normal(reward_preds, 1)
             reward_loss = -reward_dist.log_prob(rewards[:-1]).mean(dim=(0, 1))
         else:
-            reward_loss = F.mse_loss(
-                bottle(reward_model, (beliefs, posterior_states)), rewards[:-1], reduction="none"
-            ).mean(dim=(0, 1))
+            reward_loss = F.mse_loss(reward_preds, rewards[:-1], reduction="none").mean(dim=(0, 1))
+
         # transition loss
+        # TODO: why are stds not log_stds?
+        # TODO: why is this line kinda slow? like 20ms. or maybe the backward thru it is complicated?
+        # Shape (49, 50, 30)
         div = kl_divergence(Normal(posterior_means, posterior_std_devs), Normal(prior_means, prior_std_devs)).sum(
             dim=2
         )
-        # Note that normalisation by overshooting distance and weighting by overshooting distance cancel out
         kl_loss = torch.max(div, free_nats).mean(dim=(0, 1))
-        # Apply linearly ramping learning rate schedule
-        if args.learning_rate_schedule != 0:
-            for group in model_optimizer.param_groups:
-                group["lr"] = min(
-                    group["lr"] + args.model_learning_rate / args.model_learning_rate_schedule,
-                    args.model_learning_rate,
-                )
+
         model_loss = observation_loss + reward_loss + kl_loss
         # Update model parameters
-        model_optimizer.zero_grad()
+        model_optimizer.zero_grad(set_to_none=True)
         model_loss.backward()
         nn.utils.clip_grad_norm_(param_list, args.grad_clip_norm, norm_type=2)
         model_optimizer.step()
 
+
         # Dreamer implementation: actor loss calculation and optimization
+        # TODO: remove this no_grad, lol
         with torch.no_grad():
             actor_states = posterior_states.detach()
             actor_beliefs = beliefs.detach()
+        # TODO: replace this with a properly placed no_grad?
+        # Do an imagination rollout
         with FreezeParameters(model_modules):
+            # TODO: https://github.com/yusukeurakami/dreamer-pytorch/issues/10
+            # I agree with the issue - it's weird that this works.....
             imagination_traj = imagine_ahead(
                 actor_states, actor_beliefs, actor_model, transition_model, args.planning_horizon
             )
@@ -296,7 +278,7 @@ for episode in tqdm(
         )
         actor_loss = -torch.mean(returns)
         # Update model parameters
-        actor_optimizer.zero_grad()
+        actor_optimizer.zero_grad(set_to_none=True)
         actor_loss.backward()
         nn.utils.clip_grad_norm_(actor_model.parameters(), args.grad_clip_norm, norm_type=2)
         actor_optimizer.step()
@@ -307,38 +289,38 @@ for episode in tqdm(
             value_prior_states = imged_prior_states.detach()
             target_return = returns.detach()
         # detach the input tensor from the transition network.
+        # TODO: we're running the value model a second time on the same inputs. can we simplify this?
+        # TODO: shouldn't the value loss use MSE loss? and not predict a distribution?
         value_dist = Normal(bottle(value_model, (value_beliefs, value_prior_states)), 1)
         value_loss = -value_dist.log_prob(target_return).mean(dim=(0, 1))
         # Update model parameters
-        value_optimizer.zero_grad()
+        value_optimizer.zero_grad(set_to_none=True)
         value_loss.backward()
         nn.utils.clip_grad_norm_(value_model.parameters(), args.grad_clip_norm, norm_type=2)
         value_optimizer.step()
 
-        # Store (0) observation loss (1) reward loss (2) KL loss (3) actor loss (4) value loss
         losses.append(
             [observation_loss.item(), reward_loss.item(), kl_loss.item(), actor_loss.item(), value_loss.item()]
         )
 
+        training_steps += 1
+
     # Update and plot loss metrics
     losses = tuple(zip(*losses))
-    metrics["observation_loss"].append(losses[0])
-    metrics["reward_loss"].append(losses[1])
-    metrics["kl_loss"].append(losses[2])
-    metrics["actor_loss"].append(losses[3])
-    metrics["value_loss"].append(losses[4])
-    # lineplot(
-    #     metrics["episodes"][-len(metrics["observation_loss"]) :],
-    #     metrics["observation_loss"],
-    #     "observation_loss",
-    #     results_dir,
-    # )
-    # lineplot(metrics["episodes"][-len(metrics["reward_loss"]) :], metrics["reward_loss"], "reward_loss", results_dir)
-    # lineplot(metrics["episodes"][-len(metrics["kl_loss"]) :], metrics["kl_loss"], "kl_loss", results_dir)
-    # lineplot(metrics["episodes"][-len(metrics["actor_loss"]) :], metrics["actor_loss"], "actor_loss", results_dir)
-    # lineplot(metrics["episodes"][-len(metrics["value_loss"]) :], metrics["value_loss"], "value_loss", results_dir)
+    losses = [torch.tensor(x).mean() for x in losses]
 
-    # Data collection
+    wandb_lib.log_scalar("episode", episode, episode)
+    wandb_lib.log_scalar("environment_steps", environment_steps, episode)
+    wandb_lib.log_scalar("training_steps", training_steps, episode)
+
+    wandb_lib.log_scalar("observation_loss", losses[0], episode)
+    wandb_lib.log_scalar("reward_loss", losses[1], episode)
+    wandb_lib.log_scalar("kl_loss", losses[2], episode)
+    wandb_lib.log_scalar("actor_loss", losses[3], episode)
+    wandb_lib.log_scalar("value_loss", losses[4], episode)
+
+    # Data collection - collect an on-policy episode in the real environment
+    # TODO: can we not batch this??
     print("Data collection")
     with torch.no_grad():
         observation, total_reward = env.reset(), 0
@@ -348,6 +330,7 @@ for episode in tqdm(
             torch.zeros(1, env.action_size, device=args.device),
         )
         pbar = tqdm(range(args.max_episode_length // args.action_repeat))
+        # TODO: do we want explore=True?
         for t in pbar:
             # print("step",t)
             belief, posterior_state, action, next_observation, reward, done = update_belief_and_act(
@@ -370,35 +353,17 @@ for episode in tqdm(
             if done:
                 pbar.close()
                 break
-
-        # Update and plot train reward metrics
-        metrics["steps"].append(t + metrics["steps"][-1])
-        metrics["episodes"].append(episode)
-        metrics["train_rewards"].append(total_reward)
-        # lineplot(
-        #     metrics["episodes"][-len(metrics["train_rewards"]) :],
-        #     metrics["train_rewards"],
-        #     "train_rewards",
-        #     results_dir,
-        # )
+            environment_steps += 1
+        wandb_lib.log_scalar("train_rewards", total_reward, episode)
+        wandb_lib.log_scalar("train_episode_length", t, episode)
 
     # Test model
-    print("Test model")
+    # TODO: how is testing different than data collection? just disabling exploration?
     if episode % args.test_interval == 0:
-        test(args, models, metrics)
-
-    writer.add_scalar("train_reward", metrics["train_rewards"][-1], metrics["steps"][-1])
-    writer.add_scalar("train/episode_reward", metrics["train_rewards"][-1], metrics["steps"][-1] * args.action_repeat)
-    writer.add_scalar("observation_loss", metrics["observation_loss"][0][-1], metrics["steps"][-1])
-    writer.add_scalar("reward_loss", metrics["reward_loss"][0][-1], metrics["steps"][-1])
-    writer.add_scalar("kl_loss", metrics["kl_loss"][0][-1], metrics["steps"][-1])
-    writer.add_scalar("actor_loss", metrics["actor_loss"][0][-1], metrics["steps"][-1])
-    writer.add_scalar("value_loss", metrics["value_loss"][0][-1], metrics["steps"][-1])
-    print(
-        "episodes: {}, total_steps: {}, train_reward: {} ".format(
-            metrics["episodes"][-1], metrics["steps"][-1], metrics["train_rewards"][-1]
-        )
-    )
+        print("Test model")
+        test_reward = test(args, models)
+        wandb_lib.log_scalar("test/average_reward", test_reward.mean(), episode)
+        wandb_lib.log_histogram("test/reward", test_reward, episode)
 
     # Checkpoint models
     if episode % args.checkpoint_interval == 0:
@@ -416,6 +381,8 @@ for episode in tqdm(
             },
             os.path.join(results_dir, "models_%d.pth" % episode),
         )
+
+    wandb_lib.log_iteration_time(args.batch_size * args.collect_interval, episode, freq=1)
 
 
 # Close training environment
