@@ -1,6 +1,7 @@
-import cv2
 import numpy as np
 import torch
+import torchvision.transforms.functional as TF
+from einops import rearrange
 
 GYM_ENVS = [
     "Pendulum-v0",
@@ -67,11 +68,14 @@ def postprocess_observation(observation):
 
 
 def _images_to_observation(images):
-    images = torch.tensor(
-        cv2.resize(images, (64, 64), interpolation=cv2.INTER_LINEAR).transpose(2, 0, 1), dtype=torch.float32
-    )  # Resize and put channel first
-    images = preprocess_observation(images)  # Quantise, centre and dequantise inplace
-    return images.unsqueeze(dim=0)  # Add batch dimension
+    """This only takes a single image! Of shape hwc. Need to rename."""
+    # Have to take a copy here since somehow the numpy array has a negative stride which is unsupported
+    images = torch.tensor(images.copy(), dtype=torch.float32)
+    images = rearrange(images, "h w c -> c h w")
+    images = TF.resize(images, [64, 64])
+    images = preprocess_observation(images)
+    # Add batch dimension
+    return images.unsqueeze(dim=0)
 
 
 class ControlSuiteEnv:
@@ -128,12 +132,12 @@ class ControlSuiteEnv:
             observation = _images_to_observation(self._env.physics.render(camera_id=0))
         return observation, reward, done
 
-    def render(self):
-        cv2.imshow("screen", self._env.physics.render(camera_id=0)[:, :, ::-1])
-        cv2.waitKey(1)
+    # def render(self):
+    #     cv2.imshow("screen", self._env.physics.render(camera_id=0)[:, :, ::-1])
+    #     cv2.waitKey(1)
 
     def close(self):
-        cv2.destroyAllWindows()
+        # cv2.destroyAllWindows()
         self._env.close()
 
     @property
